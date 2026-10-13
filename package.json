@@ -1,0 +1,43 @@
+{
+  "name": "deepseek-usage-hud",
+  "version": "0.1.0",
+  "description": "Claude Code status line for prepaid API providers — feeds DeepSeek's balance into claude-hud's Usage slot",
+  "license": "MIT",
+  "private": false,
+  "bin": {
+    "claude-ds": "bin/claude-ds"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "install-hud": "node bin/install.js",
+    "dry-run": "node bin/install.js --dry-run",
+    "status": "node src/generate.js --status",
+    "refresh": "node src/generate.js --force --verbose",
+    "report": "node src/report.js",
+    "config": "node src/hud-config.js list"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "bin",
+    "src",
+    "skill",
+    "probe",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "claude-code",
+    "statusline",
+    "deepseek",
+    "usage",
+    "balance",
+    "claude-hud"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xli21-code/deepseek-usage-hud.git"
+  }
+}

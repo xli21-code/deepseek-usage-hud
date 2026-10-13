@@ -1,0 +1,71 @@
+name: CI
+
+# Two platforms and four Node versions, because both are claims the project
+# makes and neither was verified anywhere but one machine.
+#
+#   * macOS and Linux: the lock is a listening UNIX socket and the installer's
+#     status-line command is POSIX shell. Windows is not supported and is not
+#     tested — claiming it would be the same mistake this project keeps making,
+#     a guarantee the mechanism does not provide.
+#   * Node 18 is the floor declared in package.json (fetch and node:test both
+#     arrive there). If 18 fails, the floor is wrong and should move rather than
+#     the test being narrowed.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: node ${{ matrix.node }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: ['18', '20', '22', '24']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Versions
+        run: |
+          node --version
+          git --version
+
+      # No dependencies and no build step, so this is the whole "install".
+      - name: Syntax-check every file
+        run: |
+          for f in src/*.js bin/*.js probe/*.js test/*.js; do
+            node --check "$f" || exit 1
+          done
+          sh -n bin/claude-ds
+
+      # The suite spawns processes and opens sockets; a fast failure is usually
+      # a race rather than a bug, so run it a few times to make a flake visible
+      # here rather than in someone's pull request.
+      - name: Tests
+        run: node --test test/*.test.js
+
+      - name: Tests (repeat, to surface flakiness)
+        if: matrix.node == '22' && matrix.os == 'ubuntu-latest'
+        run: |
+          for i in 1 2 3 4 5; do
+            echo "--- run $i ---"
+            node --test test/*.test.js
+          done
+
+      # The installer's non-writing path. It resolves the settings directory,
+      # reports what it would change, and — importantly — must exit zero without
+      # touching anything.
+      - name: Installer dry run
+        run: node bin/install.js --dry-run
+        env:
+          CLAUDE_CONFIG_DIR: ${{ runner.temp }}/claude-config
+          DEEPSEEK_HUD_DATA_DIR: ${{ runner.temp }}/hud-data

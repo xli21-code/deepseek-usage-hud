@@ -1,0 +1,24 @@
+# Local data and state — never part of the source
+*.log
+*.bak
+.DS_Store
+*.jsonl
+
+# Anything that could carry a secret
+*.env
+.env
+
+# The vendored plugin is cloned at install time, by design
+vendor/
+
+# Scratch
+node_modules/
+tmp/
+
+# Internal design log and review hand-offs — working notes, never shipped.
+# Globs rather than exact names, so a new REVIEW_PROMPT_4.md is covered without
+# anyone remembering to add a line here. test/repo.test.js enforces this, which
+# is the part that actually holds: a .gitignore line is a promise, a failing
+# test is a check.
+PLAN*.md
+REVIEW_PROMPT*.md

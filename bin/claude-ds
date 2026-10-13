@@ -1,0 +1,108 @@
+#!/bin/sh
+# Launch Claude Code against DeepSeek's Anthropic-compatible endpoint.
+#
+#   claude-ds                      normal session
+#   claude-ds --dangerously-skip-permissions
+#   claude-ds -c                   continue
+#
+# Why a launcher at all: pointing Claude Code at DeepSeek is pure environment —
+# a config directory plus a handful of ANTHROPIC_*/CLAUDE_CODE_* variables. If
+# you type them by hand, missing one silently drops you back to the default
+# config: wrong account, no usage HUD, no error. This makes it one command.
+#
+# Settings are read from, in order:
+#   1. variables already exported into this shell
+#   2. $CLAUDE_CONFIG_DIR/deepseek-launcher.env   (written by bin/install.js)
+#
+# The API key is never stored here.
+
+set -eu
+
+# Which config directory to run under.
+#
+# Asked of src/paths.js rather than reimplemented here. The two used to be
+# separate implementations of the same rule, and they disagreed on inputs like
+# `~/chosen` (Node expands it, the shell does not), on whitespace, and on paths
+# containing NBSP — each disagreement a way to point a session at a directory
+# nobody wrote to, with no error. The path below is substituted by bin/install.js.
+#
+# A degraded fallback is kept for the case where Node is unavailable, because a
+# launcher that cannot start at all is worse than one that guesses.
+REPO="@@REPO@@"
+CONFIG_DIR=""
+if [ -n "$REPO" ] && [ -f "$REPO/src/paths.js" ]; then
+  CONFIG_DIR="$(command -v node >/dev/null 2>&1 && node "$REPO/src/paths.js" --print 2>/dev/null || true)"
+fi
+
+if [ -z "$CONFIG_DIR" ]; then
+  echo "claude-ds: could not resolve the config directory via src/paths.js;" >&2
+  echo "          falling back to a simpler rule. Re-run bin/install.js to fix." >&2
+  DS_ENV="${CLAUDE_CONFIG_DIR:-}"
+  case "$DS_ENV" in *[![:space:]]*) ;; *) DS_ENV="" ;; esac
+  if [ -n "$DS_ENV" ]; then
+    CONFIG_DIR="$DS_ENV"
+  elif [ -f "$HOME/.config/claude-deepseek/settings.json" ]; then
+    CONFIG_DIR="$HOME/.config/claude-deepseek"
+  else
+    CONFIG_DIR="$HOME/.claude"
+  fi
+fi
+
+[ -d "$CONFIG_DIR" ] || { echo "claude-ds: $CONFIG_DIR does not exist — run bin/install.js first" >&2; exit 1; }
+
+# PATH can be thin when called from a non-login context.
+case ":$PATH:" in
+  *":$HOME/.local/bin:"*) ;;
+  *) PATH="$HOME/.local/bin:$PATH"; export PATH ;;
+esac
+
+ENV_FILE="$CONFIG_DIR/deepseek-launcher.env"
+if [ -f "$ENV_FILE" ]; then
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+fi
+
+# Key resolution. Whatever the user has exported wins; then a dedicated env
+# file; then fail loudly, because a silent fallback burns the wrong account.
+KEY="${ANTHROPIC_AUTH_TOKEN:-${DEEPSEEK_API_KEY:-}}"
+KEY_FILE="$CONFIG_DIR/deepseek.env"
+if [ -z "$KEY" ] && [ -f "$KEY_FILE" ]; then
+  KEY="$(grep -E '^[[:space:]]*(ANTHROPIC_AUTH_TOKEN|DEEPSEEK_API_KEY)=' "$KEY_FILE" | head -1 | sed -E 's/^[^=]*=//' | tr -d '"'\''')"
+fi
+if [ -z "$KEY" ]; then
+  echo "claude-ds: no DeepSeek API key found." >&2
+  echo "          Export ANTHROPIC_AUTH_TOKEN, or put" >&2
+  echo "          ANTHROPIC_AUTH_TOKEN=sk-... in $KEY_FILE" >&2
+  exit 1
+fi
+
+# Only export it when it is NOT the main config — exporting ~/.claude would be a
+# no-op at best and misleading at worst (Claude Code would still read ~/.claude).
+if [ "$CONFIG_DIR" != "$HOME/.claude" ]; then export CLAUDE_CONFIG_DIR="$CONFIG_DIR"; fi
+export ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL:-https://api.deepseek.com/anthropic}"
+export ANTHROPIC_AUTH_TOKEN="$KEY"
+export ANTHROPIC_API_KEY=""
+
+# Model routing. Flash is the cheap default; opus and sonnet both map to the
+# pro model so that `/model opus` still means "the expensive one". Subagents
+# run on pro — their calls are real spend, and the accounting reads their
+# sidecar transcripts.
+export ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-deepseek-flash}"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="${ANTHROPIC_DEFAULT_HAIKU_MODEL:-deepseek-flash}"
+export ANTHROPIC_SMALL_FAST_MODEL="${ANTHROPIC_SMALL_FAST_MODEL:-deepseek-flash}"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="${ANTHROPIC_DEFAULT_OPUS_MODEL:-deepseek-v4-pro}"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="${ANTHROPIC_DEFAULT_SONNET_MODEL:-deepseek-v4-pro}"
+export CLAUDE_CODE_SUBAGENT_MODEL="${CLAUDE_CODE_SUBAGENT_MODEL:-deepseek-v4-pro}"
+
+# Warn, loudly, if the HUD is not going to appear. A session with a broken
+# status line still works — it just shows nothing, which is the hardest kind of
+# failure to notice. `bin/install.js` is what wires it up.
+if [ ! -f "$CONFIG_DIR/settings.json" ]; then
+  echo "claude-ds: warning — no settings.json in $CONFIG_DIR. Run bin/install.js," >&2
+  echo "          or the session will start with no status line." >&2
+elif ! grep -q '"statusLine"' "$CONFIG_DIR/settings.json" 2>/dev/null; then
+  echo "claude-ds: warning — $CONFIG_DIR/settings.json has no statusLine key," >&2
+  echo "          so the usage HUD will not appear. Run bin/install.js." >&2
+fi
+
+exec claude "$@"
