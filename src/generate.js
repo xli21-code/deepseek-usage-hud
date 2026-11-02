@@ -21,6 +21,7 @@ const { loadConfig } = require('./config');
 const { fetchBalance, appendLedger, readLedger } = require('./balance');
 const { resolveBaseline } = require('./baseline');
 const { buildSnapshot, writeSnapshot } = require('./snapshot');
+const { readPiUsage } = require('./pi-usage');
 
 const MAX_BACKOFF_MS = 15 * 60_000;
 // mtimeMs is sub-millisecond precise, so `Date.now() - mtimeMs` is routinely a
@@ -267,6 +268,9 @@ async function refreshOnce({ force = false, config } = {}) {
     const { baseline, source } = resolveBaseline(balance, cfg, readLedger());
     appendLedger(balance);
     const snapshot = buildSnapshot(balance, cfg, new Date(), baseline, source);
+    // Additive: buildSnapshot is untouched and no existing _meta field changes.
+    const pi_usage = readPiUsage(PATHS.DATA_DIR);
+    if (pi_usage) (snapshot._meta ??= {}).pi_usage = pi_usage;
     writeSnapshot(snapshot);
     recordAttempt(true);
     return { ok: true, snapshot, baseline, source };
