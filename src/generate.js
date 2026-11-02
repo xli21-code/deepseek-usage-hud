@@ -22,6 +22,7 @@ const { fetchBalance, appendLedger, readLedger } = require('./balance');
 const { resolveBaseline } = require('./baseline');
 const { buildSnapshot, writeSnapshot } = require('./snapshot');
 const { readPiUsage } = require('./pi-usage');
+const { fetchOllamaBalance, fetchOllamaUsage, usageIsFresh } = require('./ollama');
 
 const MAX_BACKOFF_MS = 15 * 60_000;
 // mtimeMs is sub-millisecond precise, so `Date.now() - mtimeMs` is routinely a
@@ -237,6 +238,33 @@ function releaseLock() {
 // ------------------------------------------------------------------- refresh
 
 /**
+ * The Ollama Cloud block, or the last good one.
+ *
+ * Two accounts, one snapshot: the DeepSeek balance keeps the primary bar and
+ * this rides along as `_meta.ollama`, exactly like `_meta.pi_usage`. Nothing in
+ * the upstream-facing fields changes, so claude-hud keeps rendering one bar
+ * from the account it was installed for.
+ *
+ * A failed fetch returns the PREVIOUS block rather than null: the same policy
+ * `refreshOnce` applies to the DeepSeek snapshot. The block's own `updated_at`
+ * is what tells a reader it is stale.
+ */
+async function collectOllama(prevSnapshot, cfg, balancePromise) {
+  const prev = prevSnapshot && prevSnapshot._meta ? prevSnapshot._meta.ollama : null;
+  const balance = await balancePromise;
+  if (!balance) return prev || null;
+
+  const seconds = Number(cfg.ollama_usage_seconds);
+  const every = Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : 300_000;
+  let usage = prev && prev.usage ? prev.usage : null;
+  if (!usage || !usageIsFresh(usage, Date.now(), every)) {
+    const fresh = await fetchOllamaUsage('24h', cfg.ollama_timeout_ms);
+    if (fresh) usage = fresh;
+  }
+  return { ...balance, usage, updated_at: new Date().toISOString() };
+}
+
+/**
  * Fetch, learn the scale, append the ledger, write the snapshot.
  *
  * The order matters: resolveBaseline runs BEFORE appendLedger, so the ledger
@@ -256,6 +284,11 @@ async function refreshOnce({ force = false, config } = {}) {
     // finished, and without this the new holder repeats its request.
     if (!force && throttledFor(cfg) > 0) return { ok: false, skipped: true, reason: 'throttled' };
 
+    // Started before the DeepSeek await so the two requests overlap; it never
+    // rejects, and an early return below simply drops the unanswered promise.
+    const ollamaPending = fetchOllamaBalance(cfg.balance_timeout_ms);
+    const previous = readJson(PATHS.snapshot, null);
+
     const balance = await fetchBalance(cfg.balance_timeout_ms);
     if (!balance) {
       // Leave the previous snapshot alone: it keeps its old updated_at, so a
@@ -271,6 +304,8 @@ async function refreshOnce({ force = false, config } = {}) {
     // Additive: buildSnapshot is untouched and no existing _meta field changes.
     const pi_usage = readPiUsage(PATHS.DATA_DIR);
     if (pi_usage) (snapshot._meta ??= {}).pi_usage = pi_usage;
+    const ollama = await collectOllama(previous, cfg, ollamaPending);
+    if (ollama) (snapshot._meta ??= {}).ollama = ollama;
     writeSnapshot(snapshot);
     recordAttempt(true);
     return { ok: true, snapshot, baseline, source };

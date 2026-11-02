@@ -11,7 +11,7 @@
  * invalidate() so a theme change cannot leave stale colours behind.
  */
 
-const PANEL_TITLE = "DeepSeek usage";
+const PANEL_TITLE = "Usage";
 const PANEL_HINT = "↑↓ 滚动 · r 刷新 · q 关闭";
 
 /** The body is report.js output verbatim; only the title and the hint are ours. */

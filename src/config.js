@@ -30,6 +30,11 @@ const DEFAULTS = {
   // hud-wrapper.js (via refreshAfterMs below), so the two cannot drift apart.
   throttle_seconds: 60,
   balance_timeout_ms: 2500,
+  // Ollama Cloud rides along in the same snapshot. Its usage endpoint is a
+  // lazily-updated aggregate, so re-reading it every throttle would spend a
+  // request to learn nothing; the balance is cheap and follows throttle_seconds.
+  ollama_timeout_ms: 4000,
+  ollama_usage_seconds: 300,
   // NOTE: there is deliberately no freshness key here. How stale a snapshot
   // claude-hud will still render is `display.externalUsageFreshnessMs` in
   // ~/.config/claude-deepseek/plugins/claude-hud/config.json — a different
