@@ -28,10 +28,11 @@ set -eu
 #
 # A degraded fallback is kept for the case where Node is unavailable, because a
 # launcher that cannot start at all is worse than one that guesses.
-REPO="@@REPO@@"
+REPO=@@REPO_SH@@
+NODE_BIN=@@NODE_SH@@
 CONFIG_DIR=""
-if [ -n "$REPO" ] && [ -f "$REPO/src/paths.js" ]; then
-  CONFIG_DIR="$(command -v node >/dev/null 2>&1 && node "$REPO/src/paths.js" --print 2>/dev/null || true)"
+if [ -x "$NODE_BIN" ] && [ -f "$REPO/src/paths.js" ]; then
+  CONFIG_DIR="$("$NODE_BIN" "$REPO/src/paths.js" --print 2>/dev/null || true)"
 fi
 
 if [ -z "$CONFIG_DIR" ]; then

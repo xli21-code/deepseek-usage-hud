@@ -8,6 +8,8 @@
 // made conditional on a file's contents, and POSIX has no compare-and-swap on a
 // path.
 //
+// A listening UNIX socket protects live writers. An exclusive recovery gate
+// serializes reclaimers; an abandoned gate fails closed rather than being stolen.
 // So the lock is a listening UNIX SOCKET with process scope:
 //
 //   * binding is serialised by the kernel, so acquisition has no race;
@@ -17,12 +19,6 @@
 //     process exit free the address. A dead process runs no code, so "the
 //     releaser deleted somebody else's lock" cannot happen at all.
 //
-// What is NOT claimed: a reclamation race, where one process proves a socket
-// dead and another does the same a moment later. Closing it would need the
-// filesystem compare-and-swap POSIX does not have. It is bounded, and the state
-// update is order-independent (see state.test.js), so the worst case is two
-// refreshes whose effects do not depend on which finished first.
-
 const os = require('node:os');
 const fs = require('node:fs');
 const net = require('node:net');
@@ -58,17 +54,36 @@ const claimScript = `require(${JSON.stringify(GENERATE)}).acquireLock().then((ok
   setTimeout(() => process.exit(0), 1200);
 });`;
 
-const winners = async (dir) =>
-  (await Promise.all(Array.from({ length: 12 }, () => runInChild(dir, claimScript)))).filter((o) =>
-    o.includes('GOT'),
-  ).length;
-
-// NOTE on strength: the twelve-process tests below are race detectors, not
-// deterministic guards. Before reclaiming was serialised by an atomic rename,
-// "a socket left by a dead holder is reclaimed" failed in roughly one run in
-// three; after it, eight consecutive full-suite runs were clean. A probabilistic
-// test is weaker than a deterministic one, and saying so is better than implying
-// a guarantee the test cannot make.
+// Hold every winner until every contender has attempted acquisition. A fixed
+// sleep lets a slow-starting contender legitimately acquire after the first
+// winner exits, which tests scheduling rather than mutual exclusion.
+async function winners(dir) {
+  const children = Array.from({ length: 12 }, () => spawn(process.execPath, ['-e', `
+    const g=require(${JSON.stringify(GENERATE)});
+    process.once('message',()=>g.acquireLock().then(ok=>process.send({claimed:ok})));
+    process.on('message',m=>{if(m==='exit')process.exit(0)});
+    process.send({ready:true});
+  `], { env: { ...process.env, DEEPSEEK_HUD_DATA_DIR: dir }, stdio: ['ignore', 'ignore', 'pipe', 'ipc'] }));
+  const message = (cp, key) => new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`child did not report ${key}`)), 15000);
+    const onMessage = m => { if (key in m) { clearTimeout(timer); cp.off('message', onMessage); resolve(m[key]); } };
+    cp.on('message', onMessage);
+    cp.once('error', reject);
+    cp.once('exit', code => { clearTimeout(timer); reject(new Error(`child exited before ${key}: ${code}`)); });
+  });
+  try {
+    const ready = children.map(cp => message(cp, 'ready'));
+    const claimed = children.map(cp => message(cp, 'claimed'));
+    await Promise.all(ready);
+    for (const cp of children) cp.send('claim');
+    return (await Promise.all(claimed)).filter(Boolean).length;
+  } finally {
+    await Promise.all(children.map(cp => new Promise(resolve => {
+      if (cp.exitCode !== null || cp.signalCode !== null) return resolve();
+      cp.once('exit', resolve); cp.kill();
+    })));
+  }
+}
 
 test('lock: twelve processes yield exactly one winner', async () => {
   const w = world();
@@ -76,21 +91,38 @@ test('lock: twelve processes yield exactly one winner', async () => {
   fs.rmSync(w.dir, { recursive: true, force: true });
 });
 
-test('lock: a socket left by a dead holder is reclaimable', async () => {
-  // Asserts reclaimability, NOT "exactly one winner". Reclaiming a dead socket
-  // cannot be made exclusive with path primitives: rename() REPLACES, so if two
-  // processes both conclude the socket is dead, the second rename wins over the
-  // first and the first has no way to notice. Both then bind and both confirm.
-  //
-  // Being precise about which property holds matters more than the assertion
-  // looking strong. The property that does hold — and the one the design leans
-  // on — is that concurrent refreshes cannot corrupt the state, which
-  // state.test.js covers. See the note in src/generate.js.
+test('lock: a socket left by a dead holder has one recovery winner', async () => {
   const w = world();
   await runInChild(w.dir, 'require("node:net").createServer().listen(process.env.DEEPSEEK_HUD_DATA_DIR+"/generator.lock",()=>process.exit(0));');
   assert.ok(fs.existsSync(w.lock), 'the socket file outlives the process');
-  assert.ok((await winners(w.dir)) >= 1, 'and it is reclaimed rather than left locked forever');
+  assert.strictEqual(await winners(w.dir), 1, 'recovery admits one writer');
   fs.rmSync(w.dir, { recursive: true, force: true });
+});
+
+test('lock: an abandoned recovery gate fails closed without deleting it', async () => {
+  const w = world();
+  await runInChild(w.dir, 'require("node:net").createServer().listen(process.env.DEEPSEEK_HUD_DATA_DIR+"/generator.lock",()=>process.exit(0));');
+  const gate = `${w.lock}.recovery`;
+  fs.mkdirSync(gate);
+  const out = await runInChild(w.dir, claimScript);
+  assert.ok(!out.includes('GOT'), 'recovery cannot steal an existing gate');
+  assert.ok(fs.existsSync(gate), 'the gate requires explicit recovery');
+  fs.rmSync(w.dir, { recursive: true, force: true });
+});
+
+test('lock: recovery cleanup failure still reaches caller release', async () => {
+  const w = world();
+  await runInChild(w.dir, 'require("node:net").createServer().listen(process.env.DEEPSEEK_HUD_DATA_DIR+"/generator.lock",()=>process.exit(0));');
+  try {
+    const out = await runInChild(w.dir, `
+      const fs=require('node:fs'),original=fs.rmSync;
+      fs.rmSync=(p,...args)=>{if(String(p).endsWith('.recovery')){const e=Error('fixture denied');e.code='EACCES';throw e;}return original(p,...args)};
+      const g=require(${JSON.stringify(GENERATE)});
+      g.acquireLock().then(ok=>{g.releaseLock();console.log(ok?'GOT+RELEASED':'SKIPPED')}).catch(()=>{console.log('REJECTED');process.exit(1)});
+    `);
+    assert.equal(out.trim(), 'GOT+RELEASED');
+    assert.ok(fs.existsSync(`${w.lock}.recovery`), 'failed cleanup remains visible for recovery');
+  } finally { fs.rmSync(w.dir, { recursive: true, force: true }); }
 });
 
 test('lock: release does not touch the path at all', async () => {

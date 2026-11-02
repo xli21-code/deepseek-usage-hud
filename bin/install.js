@@ -24,6 +24,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const { resolveInstallDir, isMainConfigDir, shellQuote } = require('../src/paths');
+const { stableNodePath } = require('../src/node-path');
 
 const REPO_ROOT = path.resolve(__dirname, '..');
 const HOME = os.homedir();
@@ -268,7 +269,8 @@ function stepLauncher() {
   // Substitute the checkout path so the installed copy can ask src/paths.js for
   // the directory instead of carrying its own copy of the rule. Two
   // implementations of one rule drift; see the note in src/paths.js.
-  const text = fs.readFileSync(LAUNCHER_SRC, 'utf8').split('@@REPO@@').join(REPO_ROOT);
+  const text = fs.readFileSync(LAUNCHER_SRC, 'utf8').replace(/@@(REPO|NODE)_SH@@/g,
+    (_, kind) => shellQuote(kind === 'REPO' ? REPO_ROOT : NODE));
   fs.writeFileSync(LAUNCHER_DEST, text, { mode: 0o755 });
   fs.chmodSync(LAUNCHER_DEST, 0o755);
   ok('installed');
@@ -307,20 +309,6 @@ function stepSkill() {
 }
 
 // ------------------------------------------------------------- 6. statusLine
-
-function stableNodePath() {
-  const exec = process.execPath;
-  const cellar = exec.match(/^(.*)\/Cellar\/[^/]+\/[^/]+\/bin\/node$/);
-  if (cellar) {
-    const stable = path.join(cellar[1], 'bin', 'node');
-    try {
-      if (fs.existsSync(stable)) return stable;
-    } catch {
-      /* fall through */
-    }
-  }
-  return exec;
-}
 
 const NODE = stableNodePath();
 
@@ -361,6 +349,10 @@ function plainCommand() {
  *  quoted form or the older unquoted one. Anything else belongs to the user. */
 function isOurPlainCommand(text) {
   const t = String(text || '').trim();
+  if (t === plainCommand()) return true;
+  const previous = readJsonStrict(path.join(DATA_DIR, 'installation.json'));
+  const oldNode = previous.state === 'ok' ? previous.value.node : null;
+  if (typeof oldNode === 'string' && t === `${shellQuote(oldNode)} ${shellQuote(WRAPPER)}`) return true;
   if (!t.endsWith(WRAPPER) && !t.endsWith(`'${WRAPPER}'`)) return false;
   const head = t.slice(0, t.length - (t.endsWith(`'${WRAPPER}'`) ? WRAPPER.length + 2 : WRAPPER.length)).trim();
   // A node path, and nothing else — no `;`, no pipes, no second command.
@@ -382,6 +374,8 @@ function isOurPlainCommand(text) {
  */
 function stripOurBranch(command) {
   const text = String(command || '');
+  const current = isDeepSeekBranch();
+  if (text.startsWith(current)) return text.slice(current.length).trim();
   const quoted = shellQuote(WRAPPER).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const node = "'[^']*'";
   const dir = "'[^']*'";
@@ -520,6 +514,14 @@ function main() {
   }
 
   try {
+    const nodeVersion = execFileSync(NODE, ['-p', 'process.versions.node'], { encoding: 'utf8', timeout: 5000 }).trim();
+    if (!/^\d+\./.test(nodeVersion) || Number(nodeVersion.split('.')[0]) < 18) {
+      throw new InstallError(`selected interpreter must be Node 18+: ${NODE}`);
+    }
+    console.log(`  node       ${NODE} (${nodeVersion})`);
+    if (/\/(?:Cellar|versions|installs|tools\/image)\//.test(NODE)) {
+      warn('selected Node path is version-specific; configure DEEPSEEK_HUD_NODE with a maintained stable entry before deleting that version');
+    }
     stepVendor();
     stepHudConfig();
     stepOurConfig();
@@ -529,6 +531,9 @@ function main() {
     stepStatusLine();
     stepCollision();
     stepCleanup();
+    writeJsonSafe(path.join(DATA_DIR, 'installation.json'), {
+      node: NODE, node_version: nodeVersion, repo: REPO_ROOT, config_dir: CONFIG_DIR,
+    });
   } catch (err) {
     if (err instanceof InstallError) {
       console.error(`\nStopped: ${err.message}\n`);

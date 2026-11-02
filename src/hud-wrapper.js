@@ -22,7 +22,7 @@ const { PATHS, ensureDataDir, log } = require('./util');
 const { loadConfig, refreshAfterMs } = require('./config');
 
 const HUD_TIMEOUT_MS = 5000;
-const STDIN_WAIT_MS = 1500;
+const STDIN_WAIT_MS = 3000;
 /** A status line is a few hundred bytes; anything past this is a runaway. */
 const MAX_HUD_OUTPUT_BYTES = 256 * 1024;
 /** Ceiling on the whole invocation, including writing the result out. The child
@@ -214,9 +214,14 @@ let rendered = false;
  * process.stdout.write() drops the buffered line, which would blank the bar
  * on exactly the failure path the fallback exists to cover.
  */
+let finishing = false;
 function finishWith(text) {
+  if (finishing) return;
+  finishing = true;
   process.stdout.write(text, () => process.exit(0));
 }
+process.stdout.on('error', () => process.exit(0));
+let stopHud = null;
 
 /**
  * Hand claude-hud a private config directory instead of the session's.
@@ -300,26 +305,6 @@ function renderHud(rawStdin) {
     finishWith(out.trim() ? out : fallbackLine(rawStdin, reason));
   };
 
-  // Not unref'd: a pending stdout write keeps the loop alive, and this is the
-  // thing that has to fire in exactly that situation.
-  //
-  // It goes through settle() rather than exiting directly. Exiting here wrote
-  // NOTHING, which made this the one path that could leave the bar completely
-  // blank — and it fired under load, where two node startups can exceed the
-  // deadline, showing up as a rare empty status line.
-  const hardStop = setTimeout(() => {
-    log(`wrapper: hard deadline of ${HARD_DEADLINE_MS}ms reached, rendering a fallback`);
-    settle('status line took too long');
-  }, HARD_DEADLINE_MS);
-  // Last resort for the case the deadline itself cannot get past: a downstream
-  // that has stopped reading holds the final write open, and a status bar is not
-  // worth hanging for.
-  const finalStop = setTimeout(() => {
-    log(`wrapper: write still pending at ${HARD_DEADLINE_MS + 2000}ms, exiting unlodged`);
-    process.exit(0);
-  }, HARD_DEADLINE_MS + 2000);
-  finalStop.unref();
-
   const bail = setTimeout(() => {
     log(`wrapper: claude-hud exceeded ${HUD_TIMEOUT_MS}ms, killing`);
     try {
@@ -348,13 +333,17 @@ function renderHud(rawStdin) {
     log(`wrapper: claude-hud spawn failed: ${err.message}`);
     settle('status line failed to start');
   });
-  child.on('exit', (code) => {
+  child.on('close', (code) => {
     settle(code === 0 ? 'status line produced no output' : `status line exited with code ${code}`);
   });
   // A child that dies early makes this write fail with EPIPE; unhandled, that
   // would crash the wrapper and leave the bar blank.
   child.stdin.on('error', () => {});
   child.stdin.end(rawStdin);
+  stopHud = () => {
+    try { child.kill('SIGKILL'); } catch { /* already gone */ }
+    settle('status line took too long');
+  };
 }
 
 /** One entry point for both paths, so the heartbeat and the refresh fire
@@ -366,11 +355,17 @@ let inputSettled = false;
 function handleInput(raw) {
   if (inputSettled) return;
   inputSettled = true;
+  process.stdin.pause();
   let parsed = null;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    /* keep null: an unparseable payload still gets a render */
+    finishWith(fallbackLine('{}', 'status line input is not valid JSON'));
+    return;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    finishWith(fallbackLine('{}', 'status line input must be an object'));
+    return;
   }
   heartbeat(parsed);
   maybeRefresh(raw);
@@ -380,7 +375,7 @@ function handleInput(raw) {
 let buf = '';
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', (c) => {
-  buf += c;
+  if (!inputSettled) buf += c;
 });
 process.stdin.on('error', () => {
   // A closed pipe mid-read must not take the whole render down.
@@ -390,12 +385,24 @@ process.stdin.on('error', () => {
 
 process.stdin.on('end', () => handleInput(buf));
 
-// The timer is unconditional, not gated on an empty buffer. Gating it meant a
-// payload that arrived PARTIALLY and then never closed hung the wrapper for as
-// long as the harness kept the pipe open — no render, no fallback, no timeout,
-// because the child had not been started yet.
+// Input gets a bounded grace period inside the invocation's deadline. Do not
+// forward a truncated JSON document or manufacture a session heartbeat for it.
 setTimeout(() => {
-  if (rendered) return;
-  log(`wrapper: stdin still open after ${STDIN_WAIT_MS}ms, rendering what arrived`);
+  if (inputSettled) return;
+  try { JSON.parse(buf); } catch {
+    inputSettled = true;
+    process.stdin.pause();
+    log(`wrapper: input did not finish within ${STDIN_WAIT_MS}ms`);
+    finishWith(fallbackLine('{}', 'status line input did not finish in time'));
+    return;
+  }
   handleInput(buf);
 }, STDIN_WAIT_MS).unref();
+
+// These deadlines start with the invocation, not after stdin or child startup.
+setTimeout(() => {
+  log(`wrapper: invocation reached ${HARD_DEADLINE_MS}ms`);
+  if (stopHud) stopHud();
+  else finishWith(fallbackLine('{}', 'status line took too long'));
+}, HARD_DEADLINE_MS);
+setTimeout(() => process.exit(0), HARD_DEADLINE_MS + 2000).unref();

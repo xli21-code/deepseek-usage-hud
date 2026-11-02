@@ -58,7 +58,7 @@ function appendShape(entry) {
   }
   lines.push(JSON.stringify(entry));
   if (lines.length > SHAPES_MAX) lines = lines.slice(-SHAPES_MAX);
-  fs.writeFileSync(SHAPES, `${lines.join('\n')}\n`);
+  fs.writeFileSync(SHAPES, `${lines.join('\n')}\n`, { mode: 0o600 });
 }
 
 function fmtTokens(n) {
@@ -112,8 +112,11 @@ process.stdin.on('end', () => {
   const entry = { probe_at: new Date().toISOString(), payload };
   try {
     fs.mkdirSync(DATA, { recursive: true });
-    fs.writeFileSync(LATEST, `${JSON.stringify(entry, null, 2)}\n`);
+    fs.writeFileSync(LATEST, `${JSON.stringify(entry, null, 2)}\n`, { mode: 0o600 });
     appendShape(entry);
+    // Creation mode does not repair a file left by an older probe.
+    fs.chmodSync(LATEST, 0o600);
+    fs.chmodSync(SHAPES, 0o600);
   } catch {
     /* never fail the statusline over logging */
   }

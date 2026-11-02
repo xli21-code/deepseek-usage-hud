@@ -11,17 +11,9 @@
 // scale wrong — it rebuilt the snapshot without the learned baseline, so a bar
 // sitting at 40% silently became 20%.
 //
-// Three guards, in order, and each exists because a review found the previous
-// arrangement unsound:
-//
-//   throttle — keyed on the last ATTEMPT, not on the snapshot's age. Age-based
-//     throttling meant that while the endpoint was failing the snapshot never
-//     updated, so every single render fired another request at a service that
-//     was already unhappy. Failures now back off exponentially.
-//   lock     — taken over by rename(), which is atomic. The old
-//     stat-then-rm-then-mkdir sequence let two processes both conclude a stale
-//     lock was theirs and both delete each other's.
-//   timeout  — the balance request is aborted after `balance_timeout_ms`.
+// Refreshes are serialized in-process and protected across processes by a
+// listening UNIX socket. Recovery of a dead socket has its own exclusive gate.
+// The throttle records attempts, including failures, and fetch has a timeout.
 
 const fs = require('node:fs');
 const { PATHS, ensureDataDir, log, readJson, atomicWriteJson } = require('./util');
@@ -79,44 +71,17 @@ function recordAttempt(ok) {
 
 // ---------------------------------------------------------------------- lock
 //
-// A listening UNIX SOCKET, not a file we create and delete.
+// A listening socket is owned until the process exits. We never close/unlink it
+// on release: Node's close() can unlink a successor's path.
 //
-// Two rounds of review broke the file-based versions, in the same place:
-// releasing is a check followed by an unlink, and a takeover can land between
-// them. That is not a bug in the check — `unlink` cannot be made conditional on
-// a file's contents, and POSIX offers no compare-and-swap on a path. Every
-// "atomic" construction on top of it (rename aside, restore, verify) just moved
-// the window.
-//
-// Binding a socket is serialised by the kernel, and a live holder ANSWERS a
-// connection, so liveness is observed rather than inferred from a timestamp.
-// Releasing is `close()` and never unlinks anything — which is what removes the
-// race entirely, because there is no longer a check-then-delete step at all.
-//
-// What is guaranteed, precisely:
-//
-//   * two processes racing an ABSENT lock: exactly one binds. The kernel
-//     serialises bind, so there is no window to speak of.
-//   * a live holder is not displaced. The probe only reports "dead" on an error
-//     that means nobody is there; a timeout counts as alive, so a busy machine
-//     degrades to "skip a refresh" rather than to two holders.
-//
-// What is NOT guaranteed, and cannot be with path primitives: two processes
-// reclaiming a DEAD socket within microseconds of each other can both end up
-// bound. rename() REPLACES, so the second claimant silently wins over the first
-// and the first has no way to notice — detecting it would take another check,
-// which is the same check-then-act race this whole design exists to avoid. An
-// earlier version tried to serialise reclamation with a rename gate; it narrowed
-// the window without closing it.
-//
-// That residual is tolerable only because the work underneath is safe to run
-// twice: reads are idempotent, writes are atomic, and the state update is
-// ordered by when readings were taken rather than when they were written (see
-// balance.js). Two concurrent refreshes therefore cannot corrupt anything, which
-// is why the design leans on order-independence rather than on a perfect lock.
+// Dead-socket recovery is serialized by an exclusive directory. Once inside,
+// recheck liveness before removing the dead socket. Nobody automatically steals
+// this gate: if a process dies while recovering, fail closed and report the path
+// for manual recovery. This trades availability after that crash for exclusion.
 
 const net = require('node:net');
 const LOCK = PATHS.lockFile;
+const RECOVERY_GATE = `${LOCK}.recovery`;
 
 let lockServer = null;
 
@@ -211,30 +176,37 @@ async function acquireLock() {
   if (first.code !== 'EADDRINUSE') return false;
   if (await holderIsAlive()) return false;
 
-  // Serialise the reclamation itself. Without this, several processes could each
-  // prove the socket dead, each remove it, and each bind — a race that showed up
-  // as two winners in roughly one run in three. rename() succeeds for exactly
-  // one racer; the rest get ENOENT and fall through to tryListen, where the
-  // kernel decides. Either way at most one process ends up bound.
-  const aside = `${LOCK}.dead.${process.pid}.${Date.now()}`;
   try {
-    fs.renameSync(LOCK, aside);
-  } catch {
-    /* another racer renamed it first — the path may already be free */
+    fs.mkdirSync(RECOVERY_GATE, { mode: 0o700 });
+  } catch (err) {
+    if (err.code === 'EEXIST') {
+      log(`socket recovery is busy or interrupted: ${RECOVERY_GATE}; remove it only after stopping all HUD generators`);
+    }
+    return false;
   }
   try {
-    // recursive: an earlier implementation made this a DIRECTORY, and a plain
-    // rmSync on one throws EISDIR — which would leave that machine unable to
-    // ever acquire the lock again.
-    fs.rmSync(aside, { recursive: true, force: true });
-  } catch {
-    /* nothing of ours to remove */
+    fs.writeFileSync(`${RECOVERY_GATE}/owner.json`, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), { mode: 0o600 });
+    // A contender may have bound the path while we waited for the recovery gate.
+    const retry = await tryListen();
+    if (retry.ok) return confirmHold(retry.server);
+    if (retry.code !== 'EADDRINUSE' || await holderIsAlive()) return false;
+    // Only this gate's owner may remove a dead path. A normal acquirer can win
+    // the bind after removal; in that case our bind fails and we stand down.
+    fs.rmSync(LOCK, { recursive: true, force: true });
+    const second = await tryListen();
+    if (!second.ok) return false;
+    const held = await confirmHold(second.server);
+    if (held) log('reclaimed a socket whose holder is no longer listening');
+    return held;
+  } finally {
+    try {
+      fs.rmSync(RECOVERY_GATE, { recursive: true, force: true });
+    } catch (err) {
+      // Do not turn a successful acquisition into a rejection while its server
+      // remains referenced. The caller must still reach its release/finally.
+      log(`could not remove recovery gate ${RECOVERY_GATE}: ${err.message}`);
+    }
   }
-  const second = await tryListen();
-  if (!second.ok) return false;
-  const held = await confirmHold(second.server);
-  if (held) log('reclaimed a socket whose holder is no longer listening');
-  return held;
 }
 
 /**
@@ -253,8 +225,7 @@ async function acquireLock() {
 function releaseLock() {
   if (!lockServer) return;
   const server = lockServer;
-  lockServer = null;
-  server.removeAllListeners('connection');
+  // Retain the process-owned server so a later refresh can reuse it.
   try {
     server.unref();
   } catch {
@@ -272,7 +243,7 @@ function releaseLock() {
  *
  * @returns {Promise<{ok:boolean, skipped?:boolean, reason?:string, snapshot?:object}>}
  */
-async function refresh({ force = false, config } = {}) {
+async function refreshOnce({ force = false, config } = {}) {
   const cfg = config || loadConfig();
 
   if (!force && throttledFor(cfg) > 0) return { ok: false, skipped: true, reason: 'throttled' };
@@ -304,9 +275,21 @@ async function refresh({ force = false, config } = {}) {
   }
 }
 
+// A process-owned socket alone does not exclude overlapping callers in the same
+// process. Queue the entire fetch/baseline/ledger/snapshot transaction.
+let refreshQueue = Promise.resolve();
+function refresh(options) {
+  const result = refreshQueue.then(() => refreshOnce(options));
+  refreshQueue = result.catch(() => {});
+  return result;
+}
+
 // -------------------------------------------------------------------- status
 
 function printStatus() {
+  const installed = readJson(`${PATHS.DATA_DIR}/installation.json`, null);
+  if (installed?.node) console.log(`installed node: ${installed.node} (${fs.existsSync(installed.node) ? installed.node_version : 'MISSING — re-run installer'})`);
+  if (fs.existsSync(RECOVERY_GATE)) console.log(`recovery gate : ${RECOVERY_GATE} (busy or interrupted; see README recovery instructions)`);
   const snap = readJson(PATHS.snapshot, null);
   if (!snap) {
     console.log('no snapshot yet');
@@ -335,7 +318,7 @@ module.exports = {
   // Exported so the failure-cleanup path can be tested directly. It is not
   // reachable through acquireLock on demand: it needs us to have bound the path
   // and then to have been displaced, which a test has to arrange by hand.
-  __testing: { tryListen, confirmHold, LOCK },
+  __testing: { tryListen, confirmHold, LOCK, RECOVERY_GATE },
 };
 
 if (require.main === module) {

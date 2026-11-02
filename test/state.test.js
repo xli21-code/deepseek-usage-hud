@@ -1,8 +1,8 @@
 'use strict';
 // The state update must not depend on the order things happened to finish in.
 //
-// This is what lets the lock be weaker than perfect without the state being
-// wrong. The case that broke it: the real balance goes 50 -> 49 -> 40, two
+// These tests cover ledger interpretation. The full refresh transaction is
+// serialized by generate.js and exercised separately in refresh.test.js. The case that broke it: the real balance goes 50 -> 49 -> 40, two
 // refreshes run concurrently, and the one that read 40 lands first. The ledger
 // then reads 50 -> 40 -> 49, the baseline resolver sees a rise that never
 // happened, treats it as a top-up, and rewrites the bar's scale — from 100 to
@@ -149,8 +149,8 @@ test('state: repeated identical readings collapse on read', () => {
 });
 
 test('state: concurrent refreshes leave the state consistent', async () => {
-  // The property the design actually leans on, since reclaiming a dead socket
-  // cannot be made exclusively atomic with path primitives (see src/generate.js).
+  // Ledger readers must still interpret deliberately out-of-order samples.
+  // This helper-level test does not establish concurrent transaction safety.
   // Several refreshes run against the same ledger at once; whatever order they
   // finish in, the reading order must reflect the order they were TAKEN, and the
   // scale must not be rewritten by a rise that never happened.

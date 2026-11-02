@@ -30,10 +30,8 @@ documented in its own source as `optional raw balance text (e.g. "¥6.35")`. The
 author put it there for exactly this case. So this repo is the other side of that
 seam: one HTTP call and a few lines of arithmetic, no fork to maintain.
 
-The whole project is about 4,200 lines of dependency-free Node — source,
-installer, calibration tools and tests together — and there is no build step.
-
-There is no build step.
+The initial public revision measured about 4,200 lines of dependency-free Node —
+source, installer, calibration tools and tests together. There is no build step.
 
 ## Requirements
 
@@ -266,6 +264,25 @@ the variables were in place.
 The status line is the only place this is visible, because it prints the model
 the API actually served.
 
+## Node upgrades
+
+The installer prefers a matching Homebrew formula link, an existing nvm `current`
+link, an asdf shim, or a Volta launcher when it can identify one. Keg-only formulae
+use their own `opt/node@…/bin/node` rather than a possibly unrelated `bin/node`.
+For other layouts, or when there is no maintained stable entry point, choose one
+explicitly:
+
+```bash
+DEEPSEEK_HUD_NODE=/absolute/path/to/stable/node node bin/install.js --dry-run
+DEEPSEEK_HUD_NODE=/absolute/path/to/stable/node node bin/install.js
+```
+
+The override must be an executable path running Node 18+. The installed launcher
+and status line both use it. `installation.json` in the data directory records
+the selected path and version; `node src/generate.js --status` displays it. A
+fallback version-specific path can still break if that version is deleted: keep
+the selected symlink/shim updated or re-run the installer after upgrading.
+
 ## Configuring
 
 Two layers, two files:
@@ -306,19 +323,29 @@ The generator throttles itself, holds a lock so concurrent sessions do not pile
 up requests, and writes atomically. The wrapper never waits on the network — a
 stale snapshot is fine, because the balance itself only moves every few minutes.
 
-The lock is a listening UNIX socket, released by the process exiting rather than
-by a delete. That is not a stylistic choice: two earlier versions released by
-removing something, and both had a window between the check and the removal where
-a takeover could land — `unlink` cannot be made conditional on a file's contents,
-and POSIX has no compare-and-swap on a path. Binding is serialised by the kernel
-and a live holder answers a connection, so acquisition has no such window, and
-release has nothing to delete with.
+The lock is a listening UNIX socket, held until the process exits. Release and
+failed-acquisition cleanup never close or unlink a socket path. A live holder is
+left alone; an inconclusive liveness probe also skips the refresh.
 
-The state it guards is also order-independent, which is what makes a weaker lock
-sufficient: every reading is stamped with the time it was *taken*, and readers
-sort by that rather than by write order. Two refreshes finishing out of order
-therefore cannot show a decrease as a rise — which is exactly what used to
-happen, silently rewriting the bar's scale.
+Reclaiming a dead socket first acquires an exclusive `generator.lock.recovery/`
+directory, then checks liveness again. Only that recovery owner can remove the
+dead socket. Concurrent calls to `refresh()` in one process are queued as complete
+fetch → baseline → ledger → snapshot transactions. Ledger timestamp ordering is
+still useful for reporting, but it is not a substitute for serializing writers.
+
+If a process dies while holding the recovery gate, later recovery fails closed.
+`node src/generate.js --status` and `generator.log` show the gate path. To recover:
+stop all Claude Code sessions and generators using that data directory, inspect
+`generator.lock.recovery/owner.json`, then remove that file and the empty directory.
+Do not remove the gate while a generator is running. An ordinary crash outside
+that brief recovery phase leaves only a dead socket, which is reclaimed
+automatically on the next refresh.
+
+The wrapper waits up to three seconds for input within a seven-second invocation
+deadline. Complete JSON can render even if its producer has not closed the pipe.
+Incomplete input gets an explicit fallback without a heartbeat or refresh. A
+separate nine-second exit ceiling covers a downstream that stops reading stdout;
+that blocked consumer cannot be guaranteed to receive the fallback.
 
 | File | Role |
 |---|---|
@@ -373,13 +400,14 @@ change.
 for top-up records, so the balance is the only evidence available, and it is
 aggregate.
 
-**A local token sum is a lower bound, by 7.3%.** Claude Code makes billed
+**The reference window had a 7.3% local token shortfall.** That measured gap is
+sample-dependent, not a constant correction for every session. Claude Code makes billed
 requests through the provider that never appear in a transcript — its own
 auto-mode classifier among them, which the harness says outright when you run
 headless against a non-Anthropic endpoint. Nothing in the transcripts reveals how
 much, which is why `capture_correction` is a fitted constant kept visible in the
-config rather than a computed one. This only affects `show_today_estimate`, which
-is off by default; the bar itself reads the balance, not a sum of tokens.
+config rather than a computed one. Those settings are reserved for a future estimate and are not used by the
+running HUD; the bar reads the balance, not a sum of tokens.
 
 **It makes one network request** where upstream claude-hud makes none. See
 [Network and credentials](#network-and-credentials).

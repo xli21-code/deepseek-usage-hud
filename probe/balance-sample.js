@@ -87,5 +87,6 @@ if (!KEY) {
 
   fs.mkdirSync(DATA, { recursive: true });
   fs.appendFileSync(LEDGER, `${JSON.stringify(sample)}\n`, { mode: 0o600 });
+  fs.chmodSync(LEDGER, 0o600);
   console.log(`${sample.at}  ${sample.currency} ${sample.total_balance}  -> ${LEDGER}`);
 })();

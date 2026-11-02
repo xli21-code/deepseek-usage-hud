@@ -44,7 +44,7 @@ if (!sinceArg || !untilArg || deltaArg === undefined) {
 const since = Date.parse(sinceArg);
 const until = Date.parse(untilArg);
 const deltaCNY = Number(deltaArg);
-if (!Number.isFinite(since) || !Number.isFinite(until) || !Number.isFinite(deltaCNY)) {
+if (!Number.isFinite(since) || !Number.isFinite(until) || until <= since || !Number.isFinite(deltaCNY) || deltaCNY < 0) {
   console.error('bad arguments');
   process.exit(2);
 }

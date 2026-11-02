@@ -96,9 +96,8 @@ async function fetchBalance(timeoutMs = 2500) {
  * top-up and rewrites the bar's scale, so a perfectly ordinary decrease silently
  * raised the scale from 100 to 49 and pinned the bar at 100%.
  *
- * Timestamps make the reader order-independent, which is what lets the lock be
- * weaker than perfect without the state being wrong: whichever write lands last,
- * a reader sees the readings in the sequence they actually occurred.
+ * Sorting makes the ledger readable in request-start order. It does not make
+ * concurrent state writers safe; generate.js serializes the complete update.
  */
 function readLedger() {
   const fs = require('node:fs');
