@@ -33,7 +33,12 @@ sh pi/link.sh          # links the sources into ~/.pi/agent/extensions/
 
 Then start a new pi session. `/ds` opens the report; `↑↓` scrolls, `r` forces a
 balance refresh, `q` closes. The status line shows the balance, its remaining
-percentage, this session's tokens and the cache hit rate.
+percentage, this session's tokens and the cache hit rate (`缓存命中 96.7%`).
+
+The bar follows the **live model**, not the snapshot: an `ollama-cloud/*` model
+shows that account in dollars, anything else keeps the DeepSeek yuan bar. The
+`/ds` report always prints both accounts, so the one that is not on the status
+line is still one command away.
 
 `link.sh` symlinks two paths, and it needs both: pi resolves relative imports
 from the **symlink path**, so `import "./deepseek-hud-lib/…"` only works when that
@@ -46,6 +51,8 @@ keeps it from colliding with another extension's `lib/`.
 |---|---|
 | balance scale, `low_balance`, `throttle_seconds` | `~/.config/claude-deepseek/deepseek-hud.json` (shared with the Claude Code install) |
 | API key | `DEEPSEEK_API_KEY` or `ANTHROPIC_AUTH_TOKEN`, else `DEEPSEEK_API_KEY=` in `~/.config/litellm/litellm.env` |
+| Ollama Cloud key | `OLLAMA_API_KEY`, else the `ollama-cloud` provider in `~/.config/magpie/providers.json` |
+| Ollama usage refresh | `ollama_usage_seconds` (default `300`) — the endpoint is a lazily-updated 24h aggregate |
 | checkout location, if not the default | `DEEPSEEK_HUD_REPO`, or `{"repoDir": "…"}` in `~/.pi/agent/deepseek-hud.json` |
 | data directory | `DEEPSEEK_HUD_DATA_DIR` (default `~/.local/share/deepseek-hud`) |
 

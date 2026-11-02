@@ -23,6 +23,13 @@
  * `_meta.pi_usage`; the status line shows the cache-hit rate instead of a cache
  * token count; the scrollable `/ds` panel lives in lib/deepseek-hud-panel.ts.
  *
+ * Phase 3 adds a second account. The snapshot now also carries
+ * `_meta.ollama`, and the status line picks the bar from the LIVE MODEL
+ * (`ctx.model`, falling back to `PI_MODEL`): an `ollama-cloud/*` model shows
+ * that account's dollar balance, anything else keeps the DeepSeek yuan bar.
+ * Two currencies must never share one percentage, so the switch is by account,
+ * not by summing them.
+ *
  * Contract: never block a render, never throw into pi, never leave it blank.
  */
 
@@ -56,6 +63,8 @@ const SIDECAR_SCHEMA = 1;
 /** message_end fires per message; the sidecar is not worth a write for each. */
 const SIDECAR_MIN_MS = 2000;
 const MAX_LINE_WIDTH = 90;
+/** Below this, an Ollama pay-as-you-go balance gets the same ⚠ the yuan bar has. */
+const OLLAMA_LOW_USD = 5;
 
 function log(msg: string) {
 	if (!DEBUG) return;
@@ -163,6 +172,9 @@ export default function deepseekHud(pi: any) {
 	/** Set once the session is gone. pi invalidates a captured ctx on shutdown and
 	 *  touching it then throws — a HUD must never take pi down with it. */
 	let stopped = false;
+	/** The model the bar should follow. Set from ctx.model on every render, so a
+	 *  `/model` switch is picked up before the next balance refresh lands. */
+	let liveModel = "";
 	const state: HudState = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, turns: 0, startedAt: Date.now() };
 
 	// ------------------------------------------------------------------ sidecar
@@ -290,23 +302,67 @@ export default function deepseekHud(pi: any) {
 		return state.cacheRead / denom;
 	}
 
+	function modelId(): string {
+		return liveModel || (process.env.PI_MODEL ?? "").trim();
+	}
+
+	/**
+	 * Which account the current model bills to.
+	 *
+	 * Unrecognised ids fall back to DeepSeek: that is the account this HUD was
+	 * installed for, and its snapshot is the one that is always present.
+	 */
+	function accountNow(): "ollama" | "deepseek" {
+		return /(^|\/)ollama-cloud\//i.test(modelId()) ? "ollama" : "deepseek";
+	}
+
 	/** The one line the status bar shows. Mirrors the HUD's "bar means remaining". */
 	function buildLine(): string {
 		const { snap } = snapshot();
-		if (!snap) return "🔋 DeepSeek: 无余额快照";
+		if (!snap) return "🔋 无余额快照";
 		const meta = snap._meta ?? {};
-		const pct = snap.model_scoped?.[0]?.utilization;
-		const ageSec = (Date.now() - Date.parse(snap.updated_at)) / 1000;
+		const account = accountNow();
+
+		let core: string[];
+		let warn = false;
+		let stamp = snap.updated_at;
+		if (account === "ollama") {
+			const ollama = meta.ollama;
+			if (!ollama) {
+				// Never silently fall back to the yuan balance here: that would label
+				// dollars as the account the user is not spending.
+				core = ["🔋 Ollama: 无快照"];
+			} else {
+				const allowance = Number(ollama.allowance_usd) > 0 ? Number(ollama.allowance_usd) : null;
+				const balance = Number(ollama.balance_usd) || 0;
+				core = [`🔋 $${balance.toFixed(2)}`];
+				if (allowance) {
+					const raw = Math.max(0, Math.min(100, (balance / allowance) * 100));
+					// One decimal just under full: at $59.75 of $60, integer rounding
+					// announces "100%" and hides the spend the account actually made.
+					core.push(`${raw >= 99 && raw < 100 ? raw.toFixed(1) : Math.round(raw)}%`);
+					warn = raw < 15;
+				} else {
+					warn = balance < OLLAMA_LOW_USD;
+				}
+				stamp = ollama.updated_at ?? stamp;
+			}
+		} else {
+			const pct = snap.model_scoped?.[0]?.utilization;
+			core = [`🔋 ${snap.balance_label ?? "?"}`];
+			if (typeof pct === "number") core.push(`${pct}%`);
+			warn = Boolean(meta.low_warning);
+		}
+
+		const ageSec = (Date.now() - Date.parse(stamp)) / 1000;
 		const stale = Number.isFinite(ageSec) && ageSec > 20 * 60 ? " ⏳" : "";
-		const core = [`🔋 ${snap.balance_label ?? "?"}`];
-		if (typeof pct === "number") core.push(`${pct}%`);
-		// Dropped first: session token counts, then the cache percentage.
+
+		// Dropped first: session token counts, then the cache hit rate.
 		const droppable: string[] = [];
 		if (state.input || state.output || state.cacheRead) droppable.push(`会话 ↓${fmt(state.input)} ↑${fmt(state.output)}`);
 		const rate = cacheRate();
-		// The old `缓存 10.8k` form is gone: one form only, and never both.
-		if (rate !== null) droppable.push(`缓存 ${(rate * 100).toFixed(1)}%`);
-		const tail = meta.low_warning ? "⚠ 余额不足" : "";
+		if (rate !== null) droppable.push(`缓存命中 ${(rate * 100).toFixed(1)}%`);
+		const tail = warn ? "⚠ 余额不足" : "";
 		const assemble = () => [...core, ...droppable, tail].filter(Boolean).join(" · ") + stale;
 		while (droppable.length && displayWidth(assemble()) > MAX_LINE_WIDTH) droppable.shift();
 		return assemble();
@@ -324,6 +380,11 @@ export default function deepseekHud(pi: any) {
 		if (stopped || !ctx) return;
 		try {
 			if (ctx.mode !== "tui") return;
+			// The live model, not the one at launch: /model can switch accounts
+			// mid-session, and the bar must follow it without waiting for a refresh.
+			const m = ctx.model;
+			const id = typeof m?.id === "string" ? m.id : typeof m?.modelId === "string" ? m.modelId : "";
+			if (id) liveModel = id;
 			const text = buildLine();
 			if (text === lastText) return;
 			lastText = text;
@@ -393,6 +454,7 @@ export default function deepseekHud(pi: any) {
 		state.turns = 0;
 		state.startedAt = Date.now();
 		lastText = "";
+		liveModel = (process.env.PI_MODEL ?? "").trim();
 		sidecarKey = `${process.pid}-${new Date(state.startedAt).toISOString()}`;
 		log(`session_start repo=${repoDir} key=${resolveKey() ? "yes" : "no"}`);
 		if (DEBUG) log(`line: ${buildLine()}`);

@@ -35,6 +35,15 @@ function duration(ms) {
   return `${Math.round(ms / 60000)}m`;
 }
 
+/** Token counts, at the precision a human reads them at. */
+function tokens(n) {
+  const v = Number(n) || 0;
+  if (v >= 1e9) return `${(v / 1e9).toFixed(1)}G`;
+  if (v >= 1e6) return `${(v / 1e6).toFixed(1)}M`;
+  if (v >= 1e3) return `${(v / 1e3).toFixed(1)}k`;
+  return String(Math.round(v));
+}
+
 /** Minimum span before a burn rate means anything. The endpoint settles in
  *  batches: two adjacent 11-minute windows once implied contradictory price
  *  factors (12.08 vs 3.46) purely from batch timing. Below this, the honest
@@ -86,6 +95,16 @@ function main() {
   console.log('DeepSeek usage');
   console.log('─'.repeat(52));
 
+  // Which account the status line is currently bar-tracking. The renderer reads
+  // this from the live model (ctx.model / PI_MODEL); printing it here means
+  // "the bar shows the wrong account" can be told apart from "the bar is wrong".
+  const modelId = String(process.env.PI_MODEL || '').trim();
+  if (modelId) {
+    const account = /^ollama-cloud\//.test(modelId) ? 'Ollama Cloud' : 'DeepSeek';
+    console.log(`model       ${modelId}`);
+    console.log(`bar tracks  ${account} — it follows the model, not the snapshot`);
+  }
+
   if (!snap) {
     console.log('No snapshot yet. Run `node src/generate.js --force` to create one.');
   } else {
@@ -106,6 +125,41 @@ function main() {
     console.log(`note        the bar shows REMAINING — shorter means less money left`);
     console.log(`snapshot    ${snap.updated_at}  (${ageS}s ago)`);
     if (snap._meta?.low_warning) console.log('warning     balance is below the alert line');
+  }
+
+  // Ollama Cloud is the second account, shown as its own block rather than
+  // blended into the DeepSeek bar: different currency, different period, and a
+  // single percentage over both would be arithmetic theatre.
+  const ollama = snap?._meta?.ollama;
+  console.log('');
+  console.log('Ollama Cloud');
+  console.log('─'.repeat(52));
+  if (!ollama) {
+    console.log('balance     no reading in the snapshot yet');
+    console.log('            Set OLLAMA_API_KEY, or keep an ollama-cloud provider in');
+    console.log('            ~/.config/magpie/providers.json — the key is read from there.');
+  } else {
+    const allowance = Number(ollama.allowance_usd) > 0 ? Number(ollama.allowance_usd) : null;
+    const bal = Number(ollama.balance_usd) || 0;
+    const pct = allowance ? Math.max(0, Math.min(100, (bal / allowance) * 100)) : null;
+    const pctLabel = pct === null ? null : pct >= 99 && pct < 100 ? pct.toFixed(1) : String(Math.round(pct));
+    const ends = ollama.period_until ? `  (period ends ${String(ollama.period_until).slice(0, 10)})` : '';
+    console.log(`balance     $${bal.toFixed(4)}${allowance ? ` / $${allowance.toFixed(2)}` : ''}${ends}`);
+    if (pct !== null) console.log(`bar         ${bar(pct)} ${pctLabel}%  (shows REMAINING)`);
+    if (Number(ollama.purchased_usd) > 0) console.log(`purchased   $${Number(ollama.purchased_usd).toFixed(2)}`);
+    const u = ollama.usage;
+    if (!u) {
+      console.log('usage 24h   not fetched yet');
+    } else {
+      console.log(`usage 24h   ${u.request_count} requests · $${Number(u.usage_usd).toFixed(4)}`);
+      console.log(
+        `tokens      ${tokens(u.input_tokens)} in (${tokens(u.cached_input_tokens)} cached, ${(Number(u.cache_hit_rate) * 100).toFixed(1)}%) · ${tokens(u.output_tokens)} out`,
+      );
+      console.log('            cached is a SUBSET of input on this endpoint: the rate is');
+      console.log('            cached/input, not cached/(input+cached) as in pi-usage.');
+    }
+    const ageS = Math.round((Date.now() - Date.parse(ollama.updated_at)) / 1000);
+    console.log(`read at     ${ollama.updated_at}${Number.isFinite(ageS) ? `  (${ageS}s ago)` : ''}`);
   }
 
   console.log('');
